@@ -10,6 +10,9 @@
 #include <signal.h>
 #include <ctype.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/vt.h>
+#include <linux/kd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <cairo/cairo.h>
@@ -33,6 +36,14 @@ static struct fb fbs[2];
 static int front = 0;
 static volatile sig_atomic_t want_quit = 0;
 static cairo_surface_t *logo = NULL;
+
+/* VT handover so Ctrl+Alt+Fn can switch to a console and back. */
+static int tty_fd = -1;
+static volatile sig_atomic_t vt_active = 1;   /* are we the foreground VT */
+static volatile sig_atomic_t vt_event = 0;    /* 1 = release request, 2 = acquired */
+
+static void on_vt_release(int s) { (void)s; vt_event = 1; }
+static void on_vt_acquire(int s) { (void)s; vt_event = 2; }
 
 static double mono_seconds(void) {
     struct timespec ts;
@@ -196,6 +207,20 @@ int main(int argc, char **argv) {
     }
     front = 0;
 
+    /* Own VT1 in process mode so Ctrl+Alt+Fn releases us (drop DRM master,
+     * reveal the console) and Ctrl+Alt+F1 brings us back (regain it, redraw). */
+    tty_fd = open("/dev/tty1", O_RDWR | O_CLOEXEC);
+    if (tty_fd >= 0) {
+        ioctl(tty_fd, VT_ACTIVATE, 1);
+        ioctl(tty_fd, VT_WAITACTIVE, 1);
+        ioctl(tty_fd, KDSETMODE, KD_GRAPHICS);
+        signal(SIGUSR1, on_vt_release);
+        signal(SIGUSR2, on_vt_acquire);
+        struct vt_mode vtm = { .mode = VT_PROCESS, .waitv = 0,
+                               .relsig = SIGUSR1, .acqsig = SIGUSR2 };
+        ioctl(tty_fd, VT_SETMODE, &vtm);
+    }
+
     double start_t = mono_seconds();
     bool fading = false;
     double fade_t0 = 0.0, alpha = 1.0;
@@ -203,6 +228,24 @@ int main(int argc, char **argv) {
     drmEventContext ev = { .version = 2, .page_flip_handler = on_flip };
 
     while (!want_quit) {
+        if (vt_event == 1) {            /* switching away: let the console show */
+            vt_event = 0;
+            drmDropMaster(drm_fd);
+            vt_active = 0;
+            if (tty_fd >= 0) ioctl(tty_fd, VT_RELDISP, 1);
+        } else if (vt_event == 2) {     /* switched back: reclaim and redraw */
+            vt_event = 0;
+            if (tty_fd >= 0) ioctl(tty_fd, VT_RELDISP, VT_ACKACQ);
+            drmSetMaster(drm_fd);
+            drmModeSetCrtc(drm_fd, crtc_id, fbs[front].fb_id, 0, 0, &connector_id, 1, &mode);
+            vt_active = 1;
+        }
+        if (!vt_active) {               /* console is foreground; idle, wait for a signal */
+            struct pollfd pfd = { tty_fd, 0, 0 };
+            poll(&pfd, 1, 200);
+            continue;
+        }
+
         int back = front ^ 1;
         render(&fbs[back], alpha);
 
@@ -234,6 +277,12 @@ int main(int argc, char **argv) {
         drmModeSetCrtc(drm_fd, saved_crtc->crtc_id, saved_crtc->buffer_id,
                        saved_crtc->x, saved_crtc->y, &connector_id, 1, &saved_crtc->mode);
         drmModeFreeCrtc(saved_crtc);
+    }
+    if (tty_fd >= 0) {
+        struct vt_mode vtm = { .mode = VT_AUTO };
+        ioctl(tty_fd, VT_SETMODE, &vtm);
+        ioctl(tty_fd, KDSETMODE, KD_TEXT);
+        close(tty_fd);
     }
     return 0;
 }

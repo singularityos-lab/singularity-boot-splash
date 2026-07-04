@@ -199,6 +199,11 @@ int main(int argc, char **argv) {
     char ready_path[512] = "";
     const char *rt = getenv("XDG_RUNTIME_DIR");
     if (rt && rt[0]) snprintf(ready_path, sizeof ready_path, "%s/singularity-shell-ready", rt);
+    /* The boot-splash runs as root in sysinit, so XDG_RUNTIME_DIR is usually
+     * unset and the shell-ready file (written by the user session after login)
+     * never applies to the GREETER handoff. Watch a fixed, root-readable path the
+     * greeter touches when it comes up, so boot -> greeter hands off adaptively. */
+    char greeter_path[512] = "/run/singularity/greeter-ready";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) dev = argv[++i];
@@ -206,6 +211,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--wait-seconds") == 0 && i + 1 < argc) wait_seconds = atof(argv[++i]);
         else if (strcmp(argv[i], "--handoff") == 0 && i + 1 < argc) handoff_seconds = atof(argv[++i]);
         else if (strcmp(argv[i], "--max-life") == 0 && i + 1 < argc) safety_seconds = atof(argv[++i]);
+        else if (strcmp(argv[i], "--greeter-ready") == 0 && i + 1 < argc) snprintf(greeter_path, sizeof greeter_path, "%s", argv[++i]);
     }
 
     signal(SIGINT, on_signal);
@@ -292,7 +298,8 @@ int main(int argc, char **argv) {
         front = back;
 
         double t = mono_seconds();
-        bool ready = ready_path[0] && access(ready_path, F_OK) == 0;
+        bool ready = (ready_path[0] && access(ready_path, F_OK) == 0) ||
+                     (greeter_path[0] && access(greeter_path, F_OK) == 0);
         bool timed_out = max_seconds > 0.0 && (t - start_t) > max_seconds;
         bool safety = (t - start_t) > safety_seconds;   /* never hold the master forever */
         if (ready || timed_out || safety) break;   /* hold the last full frame; the compositor cross-fades in over it */

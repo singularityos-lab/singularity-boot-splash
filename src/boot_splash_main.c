@@ -156,6 +156,24 @@ static bool pick_output(void) {
     return ok;
 }
 
+/* Wait until the DRM device exists AND exposes a connected output with a mode,
+ * then become master. Early in boot the card node can be absent and the
+ * connector unprobed (i915 finishes its modeset a couple of seconds in); drawing
+ * before that is what paints the black/glitch spots before the greeter. Retrying
+ * until a real output is ready means the first frame we set is a stable one. */
+static bool wait_for_card(const char *dev, double timeout) {
+    double t0 = mono_seconds();
+    for (;;) {
+        if (drm_fd < 0) {
+            drm_fd = open(dev, O_RDWR | O_CLOEXEC);
+            if (drm_fd >= 0) drmSetMaster(drm_fd);
+        }
+        if (drm_fd >= 0 && pick_output()) return true;
+        if (mono_seconds() - t0 > timeout) return false;
+        usleep(100000); /* 100 ms */
+    }
+}
+
 static void render(struct fb *f, double alpha) {
     cairo_t *cr = cairo_create(f->surface);
     cairo_push_group(cr);
@@ -175,6 +193,8 @@ static void on_flip(int fd, unsigned seq, unsigned tv_sec, unsigned tv_usec, voi
 int main(int argc, char **argv) {
     const char *dev = "/dev/dri/card0";
     double max_seconds = 0.0;
+    double wait_seconds = 8.0;    /* wait this long for the DRM output to be ready */
+    double handoff_seconds = 1.5; /* hold the last frame this long after dropping master */
     char ready_path[512] = "";
     const char *rt = getenv("XDG_RUNTIME_DIR");
     if (rt && rt[0]) snprintf(ready_path, sizeof ready_path, "%s/singularity-shell-ready", rt);
@@ -182,6 +202,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) dev = argv[++i];
         else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) max_seconds = atof(argv[++i]);
+        else if (strcmp(argv[i], "--wait-seconds") == 0 && i + 1 < argc) wait_seconds = atof(argv[++i]);
+        else if (strcmp(argv[i], "--handoff") == 0 && i + 1 < argc) handoff_seconds = atof(argv[++i]);
     }
 
     signal(SIGINT, on_signal);
@@ -189,11 +211,10 @@ int main(int argc, char **argv) {
 
     load_logo();
 
-    drm_fd = open(dev, O_RDWR | O_CLOEXEC);
-    if (drm_fd < 0) { fprintf(stderr, "boot-splash: cannot open %s: %s\n", dev, strerror(errno)); return 1; }
-    drmSetMaster(drm_fd);
-
-    if (!pick_output()) { fprintf(stderr, "boot-splash: no connected output\n"); return 1; }
+    if (!wait_for_card(dev, wait_seconds)) {
+        fprintf(stderr, "boot-splash: no ready DRM output on %s within %.1fs\n", dev, wait_seconds);
+        return 1;
+    }
     if (create_fb(&fbs[0], mode.hdisplay, mode.vdisplay) < 0 ||
         create_fb(&fbs[1], mode.hdisplay, mode.vdisplay) < 0) {
         fprintf(stderr, "boot-splash: cannot create framebuffers\n"); return 1;
@@ -222,8 +243,7 @@ int main(int argc, char **argv) {
     }
 
     double start_t = mono_seconds();
-    bool fading = false;
-    double fade_t0 = 0.0, alpha = 1.0;
+    double alpha = 1.0;
     int flip_pending = 0;
     drmEventContext ev = { .version = 2, .page_flip_handler = on_flip };
 
@@ -262,26 +282,23 @@ int main(int argc, char **argv) {
         front = back;
 
         double t = mono_seconds();
-        if (!fading) {
-            bool ready = ready_path[0] && access(ready_path, F_OK) == 0;
-            bool timed_out = max_seconds > 0.0 && (t - start_t) > max_seconds;
-            if (ready || timed_out) { fading = true; fade_t0 = t; }
-        }
-        if (fading) {
-            alpha = 1.0 - (t - fade_t0) / 0.25;
-            if (alpha <= 0.0) break;
-        }
+        bool ready = ready_path[0] && access(ready_path, F_OK) == 0;
+        bool timed_out = max_seconds > 0.0 && (t - start_t) > max_seconds;
+        if (ready || timed_out) break;   /* hold the last full frame; the compositor cross-fades in over it */
     }
 
-    if (saved_crtc) {
-        drmModeSetCrtc(drm_fd, saved_crtc->crtc_id, saved_crtc->buffer_id,
-                       saved_crtc->x, saved_crtc->y, &connector_id, 1, &saved_crtc->mode);
-        drmModeFreeCrtc(saved_crtc);
-    }
+    /* Graceful handoff (plymouth-style): drop the master so the compositor can
+     * take it via seatd, then hold our last frame on the CRTC for a short grace
+     * window before freeing the framebuffers, so the compositor paints over a
+     * live image instead of a blanked CRTC and there is no black gap. Kept brief
+     * because under this init a conflicting greeter waits for us to exit. */
+    drmDropMaster(drm_fd);
+    for (double h0 = mono_seconds(); mono_seconds() - h0 < handoff_seconds;)
+        usleep(50000);
+    if (saved_crtc) drmModeFreeCrtc(saved_crtc);
     if (tty_fd >= 0) {
         struct vt_mode vtm = { .mode = VT_AUTO };
         ioctl(tty_fd, VT_SETMODE, &vtm);
-        ioctl(tty_fd, KDSETMODE, KD_TEXT);
         close(tty_fd);
     }
     return 0;

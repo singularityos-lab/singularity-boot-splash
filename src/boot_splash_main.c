@@ -195,6 +195,7 @@ int main(int argc, char **argv) {
     double max_seconds = 0.0;
     double wait_seconds = 8.0;    /* wait this long for the DRM output to be ready */
     double handoff_seconds = 1.5; /* hold the last frame this long after dropping master */
+    double safety_seconds = 30.0; /* hard cap: never hold the DRM master longer than this */
     char ready_path[512] = "";
     const char *rt = getenv("XDG_RUNTIME_DIR");
     if (rt && rt[0]) snprintf(ready_path, sizeof ready_path, "%s/singularity-shell-ready", rt);
@@ -204,6 +205,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) max_seconds = atof(argv[++i]);
         else if (strcmp(argv[i], "--wait-seconds") == 0 && i + 1 < argc) wait_seconds = atof(argv[++i]);
         else if (strcmp(argv[i], "--handoff") == 0 && i + 1 < argc) handoff_seconds = atof(argv[++i]);
+        else if (strcmp(argv[i], "--max-life") == 0 && i + 1 < argc) safety_seconds = atof(argv[++i]);
     }
 
     signal(SIGINT, on_signal);
@@ -270,9 +272,17 @@ int main(int argc, char **argv) {
         render(&fbs[back], alpha);
 
         flip_pending = 1;
-        if (drmModePageFlip(drm_fd, crtc_id, fbs[back].fb_id, DRM_MODE_PAGE_FLIP_EVENT, &flip_pending) < 0) {
+        int flip_rc = drmModePageFlip(drm_fd, crtc_id, fbs[back].fb_id, DRM_MODE_PAGE_FLIP_EVENT, &flip_pending);
+        if (flip_rc < 0) {
             flip_pending = 0;
-            usleep(16000);
+            /* Losing the master (EACCES/EPERM) means the compositor, the greeter's
+             * or the session's, has taken the display: that IS the handoff signal.
+             * Exit so it can paint. This is what makes removing greetd's
+             * Conflicts= safe even before the shell-ready sentinel exists. */
+            if (flip_rc == -EACCES || flip_rc == -EPERM || errno == EACCES || errno == EPERM)
+                want_quit = 1;
+            else
+                usleep(16000);
         }
         while (flip_pending && !want_quit) {
             struct pollfd pfd = { drm_fd, POLLIN, 0 };
@@ -284,7 +294,8 @@ int main(int argc, char **argv) {
         double t = mono_seconds();
         bool ready = ready_path[0] && access(ready_path, F_OK) == 0;
         bool timed_out = max_seconds > 0.0 && (t - start_t) > max_seconds;
-        if (ready || timed_out) break;   /* hold the last full frame; the compositor cross-fades in over it */
+        bool safety = (t - start_t) > safety_seconds;   /* never hold the master forever */
+        if (ready || timed_out || safety) break;   /* hold the last full frame; the compositor cross-fades in over it */
     }
 
     /* Graceful handoff (plymouth-style): drop the master so the compositor can

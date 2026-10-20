@@ -117,17 +117,89 @@ static bool pick_output(void) {
     return ok;
 }
 
-static bool wait_for_card(const char *dev, double timeout) {
+static bool drm_is_fallback = false;
+static char drm_path[64];
+
+static bool fallback_driver(int fd) {
+    drmVersionPtr v = drmGetVersion(fd);
+    if (!v) return true;
+    bool fb = v->name && (strcmp(v->name, "simpledrm") == 0 || strcmp(v->name, "efidrm") == 0 ||
+                          strcmp(v->name, "vesadrm") == 0 || strcmp(v->name, "ofdrm") == 0);
+    drmFreeVersion(v);
+    return fb;
+}
+
+static bool open_card(const char *path) {
+    drm_fd = open(path, O_RDWR | O_CLOEXEC);
+    if (drm_fd < 0) return false;
+    drmSetMaster(drm_fd);
+    if (pick_output()) {
+        snprintf(drm_path, sizeof drm_path, "%s", path);
+        drm_is_fallback = fallback_driver(drm_fd);
+        return true;
+    }
+    close(drm_fd);
+    drm_fd = -1;
+    return false;
+}
+
+static bool real_card_ready(void) {
+    char path[32];
+    for (int i = 0; i < 8; i++) {
+        snprintf(path, sizeof path, "/dev/dri/card%d", i);
+        if (strcmp(path, drm_path) == 0) continue;
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+        bool real = !fallback_driver(fd);
+        bool connected = false;
+        drmModeRes *res = real ? drmModeGetResources(fd) : NULL;
+        if (res) {
+            for (int c = 0; c < res->count_connectors && !connected; c++) {
+                drmModeConnector *conn = drmModeGetConnector(fd, res->connectors[c]);
+                if (!conn) continue;
+                connected = conn->connection == DRM_MODE_CONNECTED && conn->count_modes > 0;
+                drmModeFreeConnector(conn);
+            }
+            drmModeFreeResources(res);
+        }
+        close(fd);
+        if (connected) return true;
+    }
+    return false;
+}
+
+static bool wait_for_card(const char *dev, double timeout, double fallback_after) {
     double t0 = boot_seconds();
     for (;;) {
-        if (drm_fd < 0) {
-            drm_fd = open(dev, O_RDWR | O_CLOEXEC);
-            if (drm_fd >= 0) drmSetMaster(drm_fd);
+        if (dev) {
+            if (open_card(dev)) return true;
+        } else {
+            char path[32];
+            for (int i = 0; i < 8 && drm_fd < 0; i++) {
+                snprintf(path, sizeof path, "/dev/dri/card%d", i);
+                int fd = open(path, O_RDWR | O_CLOEXEC);
+                if (fd < 0) continue;
+                bool fb = fallback_driver(fd);
+                close(fd);
+                if (fb && boot_seconds() - t0 < fallback_after) continue;
+                open_card(path);
+            }
+            if (drm_fd >= 0) return true;
         }
-        if (drm_fd >= 0 && pick_output()) return true;
         if (boot_seconds() - t0 > timeout) return false;
         usleep(50000);
     }
+}
+
+static void destroy_fb(struct fb *f) {
+    if (f->surface) cairo_surface_destroy(f->surface);
+    if (f->map && f->map != MAP_FAILED) munmap(f->map, f->size);
+    if (f->fb_id) drmModeRmFB(drm_fd, f->fb_id);
+    if (f->handle) {
+        struct drm_mode_destroy_dumb dreq = { .handle = f->handle };
+        drmIoctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+    }
+    memset(f, 0, sizeof *f);
 }
 
 static void render(struct fb *f, double progress) {
@@ -198,7 +270,7 @@ static void write_loader_surface(const char *path, struct fb *f) {
 }
 
 int main(int argc, char **argv) {
-    const char *dev = "/dev/dri/card0";
+    const char *dev = NULL;
     const char *surface_path = LOADER_SURFACE;
     double wait_seconds = 10.0;
     double safety_seconds = 60.0;
@@ -218,8 +290,8 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_signal);
     load_logo();
 
-    if (!wait_for_card(dev, wait_seconds)) {
-        fprintf(stderr, "boot-splash: no ready DRM output on %s within %.1fs\n", dev, wait_seconds);
+    if (!wait_for_card(dev, wait_seconds, 3.0)) {
+        fprintf(stderr, "boot-splash: no ready DRM output on %s within %.1fs\n", dev ? dev : "any card", wait_seconds);
         return 1;
     }
     if (create_fb(&fbs[0], mode.hdisplay, mode.vdisplay) < 0 ||
@@ -237,9 +309,9 @@ int main(int argc, char **argv) {
     }
     flush_fb(&fbs[0]);
     front = 0;
-    fprintf(stderr, "boot-splash: showing on connector %u at %ux%u, %.2fs after boot\n",
-            connector_id, mode.hdisplay, mode.vdisplay, start_t);
-    if (surface_path[0]) write_loader_surface(surface_path, &fbs[0]);
+    fprintf(stderr, "boot-splash: showing on %s connector %u at %ux%u, %.2fs after boot%s\n",
+            drm_path, connector_id, mode.hdisplay, mode.vdisplay, start_t, drm_is_fallback ? " (firmware framebuffer)" : "");
+    if (surface_path[0] && !drm_is_fallback) write_loader_surface(surface_path, &fbs[0]);
 
     tty_fd = open("/dev/tty1", O_RDWR | O_CLOEXEC);
     if (tty_fd >= 0) {
@@ -254,7 +326,9 @@ int main(int argc, char **argv) {
     int flip_pending = 0;
     drmEventContext ev = { .version = 2, .page_flip_handler = on_flip };
     double last_write = 0.0;
+    double last_probe = 0.0;
     bool handed_over = false;
+    bool switch_card = false;
 
     while (!want_quit) {
         if (vt_event == 1) {
@@ -280,6 +354,34 @@ int main(int argc, char **argv) {
         if (exists(TAKING_OVER)) { handed_over = true; break; }
         if (t - start_t > safety_seconds) break;
 
+        if (!dev && drm_is_fallback && t - last_probe > 0.25) {
+            last_probe = t;
+            if (real_card_ready()) switch_card = true;
+        }
+        if (switch_card) {
+            switch_card = false;
+            destroy_fb(&fbs[0]);
+            destroy_fb(&fbs[1]);
+            drmDropMaster(drm_fd);
+            close(drm_fd);
+            drm_fd = -1;
+            drm_path[0] = 0;
+            if (!wait_for_card(dev, 5.0, 0.0) ||
+                create_fb(&fbs[0], mode.hdisplay, mode.vdisplay) < 0 ||
+                create_fb(&fbs[1], mode.hdisplay, mode.vdisplay) < 0) {
+                fprintf(stderr, "boot-splash: lost the display while switching cards\n");
+                break;
+            }
+            render(&fbs[0], progress);
+            drmModeSetCrtc(drm_fd, crtc_id, fbs[0].fb_id, 0, 0, &connector_id, 1, &mode);
+            flush_fb(&fbs[0]);
+            front = 0;
+            fprintf(stderr, "boot-splash: moved to %s connector %u at %ux%u, %.2fs after boot%s\n",
+                    drm_path, connector_id, mode.hdisplay, mode.vdisplay, t, drm_is_fallback ? " (firmware framebuffer)" : "");
+            if (surface_path[0] && !drm_is_fallback) write_loader_surface(surface_path, &fbs[0]);
+            continue;
+        }
+
         if (!vt_active) {
             struct pollfd pfd = { tty_fd, 0, 0 };
             poll(&pfd, 1, 100);
@@ -292,6 +394,7 @@ int main(int argc, char **argv) {
         if (drmModePageFlip(drm_fd, crtc_id, fbs[back].fb_id, DRM_MODE_PAGE_FLIP_EVENT, &flip_pending) < 0) {
             flip_pending = 0;
             if (errno == EACCES || errno == EPERM) break;
+            if (errno == ENODEV || errno == ENOENT || errno == EIO) { switch_card = true; continue; }
             usleep(16000);
             continue;
         }

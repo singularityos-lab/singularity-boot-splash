@@ -24,6 +24,14 @@
 #define MASTER_RELEASED "/run/singularity/boot-splash-master-released"
 #define FIRST_FRAME "/run/singularity/compositor-first-frame"
 #define LOADER_SURFACE "/boot/efi/EFI/atom/surface.bin"
+#define FIRMWARE_FB "/dev/dri/sixfb"
+#define FIRMWARE_FB_INFO _IOR('d', 0xf0, struct firmware_fb_info)
+#define FIRMWARE_FB_OWNER "/run/six-display.log"
+
+struct firmware_fb_info {
+    uint64_t size;
+    uint32_t width, height, stride, mask_r, mask_g, mask_b;
+};
 
 struct fb {
     uint32_t fb_id;
@@ -269,6 +277,68 @@ static void write_loader_surface(const char *path, struct fb *f) {
     free(buf);
 }
 
+static bool any_card(void) {
+    char path[32];
+    for (int i = 0; i < 8; i++) {
+        snprintf(path, sizeof path, "/dev/dri/card%d", i);
+        if (exists(path)) return true;
+    }
+    return false;
+}
+
+static void blit_firmware(uint8_t *dst, const struct firmware_fb_info *info, cairo_surface_t *src) {
+    const uint8_t *data = cairo_image_surface_get_data(src);
+    int pitch = cairo_image_surface_get_stride(src);
+    bool swap = info->mask_r == 0xff;
+    for (uint32_t y = 0; y < info->height; y++) {
+        const uint32_t *row = (const uint32_t *)(data + (size_t)y * pitch);
+        uint32_t *out = (uint32_t *)(dst + (size_t)y * info->stride * 4);
+        if (!swap) {
+            memcpy(out, row, (size_t)info->width * 4);
+            continue;
+        }
+        for (uint32_t x = 0; x < info->width; x++) {
+            uint32_t p = row[x];
+            out[x] = (p & 0xff00) | (p >> 16 & 0xff) | (p & 0xff) << 16;
+        }
+    }
+}
+
+static int run_firmware_fb(double safety_seconds) {
+    int fd = open(FIRMWARE_FB, O_RDWR | O_CLOEXEC);
+    struct firmware_fb_info info;
+    if (fd < 0 || ioctl(fd, FIRMWARE_FB_INFO, &info) != 0 || info.width == 0 || info.height == 0) {
+        fprintf(stderr, "boot-splash: no firmware framebuffer\n");
+        return 1;
+    }
+    uint8_t *map = mmap(NULL, info.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "boot-splash: cannot map the firmware framebuffer: %s\n", strerror(errno));
+        return 1;
+    }
+    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24, (int)info.width, (int)info.height);
+    double start_t = boot_seconds();
+    double progress = 0.0;
+    fprintf(stderr, "boot-splash: showing on %s at %ux%u, %.2fs after boot\n", FIRMWARE_FB, info.width, info.height, start_t);
+    while (!want_quit) {
+        double t = boot_seconds();
+        progress = loginui_progress_curve(0.0, 0.45, t - start_t, 4.0);
+        loginui_progress_write(LOGINUI_PROGRESS_PATH, progress);
+        if (exists(FIRMWARE_FB_OWNER) || exists(FIRST_FRAME) || any_card() || t - start_t > safety_seconds) break;
+        cairo_t *cr = cairo_create(surface);
+        loginui_render_brand_progress(cr, (int)info.width, (int)info.height, 1.0, logo, progress, 1.0);
+        cairo_destroy(cr);
+        cairo_surface_flush(surface);
+        blit_firmware(map, &info, surface);
+        usleep(33000);
+    }
+    fprintf(stderr, "boot-splash: released the firmware framebuffer at %.2f\n", progress);
+    cairo_surface_destroy(surface);
+    munmap(map, info.size);
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *dev = NULL;
     const char *surface_path = LOADER_SURFACE;
@@ -289,6 +359,8 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     load_logo();
+
+    if (!dev && !any_card() && exists(FIRMWARE_FB)) return run_firmware_fb(safety_seconds);
 
     if (!wait_for_card(dev, wait_seconds, 3.0)) {
         fprintf(stderr, "boot-splash: no ready DRM output on %s within %.1fs\n", dev ? dev : "any card", wait_seconds);

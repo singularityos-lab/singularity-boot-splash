@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <ctype.h>
+#include <math.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
@@ -24,6 +25,8 @@
 #define MASTER_RELEASED "/run/singularity/boot-splash-master-released"
 #define FIRST_FRAME "/run/singularity/compositor-first-frame"
 #define LOADER_SURFACE "/boot/efi/EFI/atom/surface.bin"
+#define LOADER_NOTICE "/boot/efi/EFI/atom/notice.bin"
+#define NOTICE_AFTER_SECONDS 12.0
 #define FIRMWARE_FB "/dev/dri/sixfb"
 #define FIRMWARE_FB_INFO _IOR('d', 0xf0, struct firmware_fb_info)
 #define FIRMWARE_FB_OWNER "/run/six-display.log"
@@ -49,6 +52,10 @@ static struct fb fbs[2];
 static int front = 0;
 static volatile sig_atomic_t want_quit = 0;
 static cairo_surface_t *logo = NULL;
+
+static const char *notice = NULL;
+static double notice_alpha = 0.0;
+static double notice_checked = 0.0;
 
 static int tty_fd = -1;
 static volatile sig_atomic_t vt_active = 1;
@@ -210,9 +217,22 @@ static void destroy_fb(struct fb *f) {
     memset(f, 0, sizeof *f);
 }
 
+static void update_notice(double t) {
+    if (t < NOTICE_AFTER_SECONDS || t - notice_checked < 0.5) return;
+    notice_checked = t;
+    notice = loginui_gpu_notice("/sys");
+    if (notice && notice_alpha < 1.0) notice_alpha = notice_alpha + 0.5 > 1.0 ? 1.0 : notice_alpha + 0.5;
+    if (!notice) notice_alpha = 0.0;
+}
+
+static void draw_frame(cairo_t *cr, int width, int height, double progress) {
+    loginui_render_brand_progress(cr, width, height, 1.0, logo, progress, 1.0);
+    loginui_render_brand_notice(cr, width, height, 1.0, notice, notice_alpha);
+}
+
 static void render(struct fb *f, double progress) {
     cairo_t *cr = cairo_create(f->surface);
-    loginui_render_brand_progress(cr, mode.hdisplay, mode.vdisplay, 1.0, logo, progress, 1.0);
+    draw_frame(cr, mode.hdisplay, mode.vdisplay, progress);
     cairo_destroy(cr);
     cairo_surface_flush(f->surface);
 }
@@ -225,6 +245,32 @@ static void flush_fb(struct fb *f) {
 static void on_flip(int fd, unsigned seq, unsigned tv_sec, unsigned tv_usec, void *data) {
     (void)fd; (void)seq; (void)tv_sec; (void)tv_usec;
     *((int *)data) = 0;
+}
+
+static bool write_atomic(const char *path, const uint8_t *buf, size_t n) {
+    bool same = false;
+    FILE *old = fopen(path, "rb");
+    if (old) {
+        uint8_t *cur = malloc(n + 1);
+        if (cur) {
+            size_t r = fread(cur, 1, n + 1, old);
+            same = r == n && memcmp(cur, buf, n) == 0;
+            free(cur);
+        }
+        fclose(old);
+    }
+    if (same) return false;
+    char tmp[512];
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    FILE *out = fopen(tmp, "wb");
+    if (!out) return false;
+    bool ok = fwrite(buf, 1, n, out) == n;
+    ok = fflush(out) == 0 && ok;
+    fsync(fileno(out));
+    fclose(out);
+    if (ok && rename(tmp, path) == 0) return true;
+    unlink(tmp);
+    return false;
 }
 
 static void write_loader_surface(const char *path, struct fb *f) {
@@ -248,33 +294,47 @@ static void write_loader_surface(const char *path, struct fb *f) {
         memcpy(buf + 8 + (size_t)y * lw * 4, f->map + (size_t)(oy + y) * f->pitch + (size_t)ox * 4, (size_t)lw * 4);
     for (size_t i = 8 + 3; i < n; i += 4) buf[i] = 0;
 
-    bool same = false;
-    FILE *old = fopen(path, "rb");
-    if (old) {
-        uint8_t *cur = malloc(n + 1);
-        if (cur) {
-            size_t r = fread(cur, 1, n + 1, old);
-            same = r == n && memcmp(cur, buf, n) == 0;
-            free(cur);
-        }
-        fclose(old);
-    }
-    if (!same) {
-        char tmp[512];
-        snprintf(tmp, sizeof tmp, "%s.new", path);
-        FILE *out = fopen(tmp, "wb");
-        if (out) {
-            bool ok = fwrite(buf, 1, n, out) == n;
-            ok = fflush(out) == 0 && ok;
-            fsync(fileno(out));
-            fclose(out);
-            if (ok && rename(tmp, path) == 0)
-                fprintf(stderr, "boot-splash: loader surface updated (%dx%d)\n", lw, lh);
-            else
-                unlink(tmp);
-        }
-    }
+    if (write_atomic(path, buf, n))
+        fprintf(stderr, "boot-splash: loader surface updated (%dx%d)\n", lw, lh);
     free(buf);
+}
+
+static void write_loader_notice(const char *path, int width, int height) {
+    const char *text = loginui_gpu_notice("/sys");
+    if (!text) {
+        if (unlink(path) == 0) fprintf(stderr, "boot-splash: loader notice removed\n");
+        return;
+    }
+    cairo_surface_t *probe = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 1, 1);
+    cairo_t *pcr = cairo_create(probe);
+    double x, y, w, h;
+    loginui_brand_notice_box(pcr, width, height, 1.0, text, &x, &y, &w, &h);
+    cairo_destroy(pcr);
+    cairo_surface_destroy(probe);
+    int nw = (int)ceil(w), nh = (int)ceil(h) + 2;
+    if (nw <= 0 || nh <= 2) return;
+    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_RGB24, nw, nh);
+    cairo_t *cr = cairo_create(s);
+    cairo_set_source_rgb(cr, 0, 0, 0);
+    cairo_paint(cr);
+    cairo_translate(cr, -x, -y);
+    loginui_render_brand_notice(cr, width, height, 1.0, text, 1.0);
+    cairo_destroy(cr);
+    cairo_surface_flush(s);
+    size_t n = 8 + (size_t)nw * nh * 4;
+    uint8_t *buf = malloc(n);
+    if (buf) {
+        uint32_t hdr[2] = { (uint32_t)nw, (uint32_t)nh };
+        memcpy(buf, hdr, 8);
+        const uint8_t *data = cairo_image_surface_get_data(s);
+        int stride = cairo_image_surface_get_stride(s);
+        for (int yy = 0; yy < nh; yy++)
+            memcpy(buf + 8 + (size_t)yy * nw * 4, data + (size_t)yy * stride, (size_t)nw * 4);
+        for (size_t i = 8 + 3; i < n; i += 4) buf[i] = 0;
+        if (write_atomic(path, buf, n)) fprintf(stderr, "boot-splash: loader notice updated (%dx%d)\n", nw, nh);
+        free(buf);
+    }
+    cairo_surface_destroy(s);
 }
 
 static bool any_card(void) {
@@ -325,8 +385,9 @@ static int run_firmware_fb(double safety_seconds) {
         progress = loginui_progress_curve(0.0, 0.45, t - start_t, 4.0);
         loginui_progress_write(LOGINUI_PROGRESS_PATH, progress);
         if (exists(FIRMWARE_FB_OWNER) || exists(FIRST_FRAME) || any_card() || t - start_t > safety_seconds) break;
+        update_notice(t);
         cairo_t *cr = cairo_create(surface);
-        loginui_render_brand_progress(cr, (int)info.width, (int)info.height, 1.0, logo, progress, 1.0);
+        draw_frame(cr, (int)info.width, (int)info.height, progress);
         cairo_destroy(cr);
         cairo_surface_flush(surface);
         blit_firmware(map, &info, surface);
@@ -342,6 +403,7 @@ static int run_firmware_fb(double safety_seconds) {
 int main(int argc, char **argv) {
     const char *dev = NULL;
     const char *surface_path = LOADER_SURFACE;
+    const char *notice_path = LOADER_NOTICE;
     double wait_seconds = 10.0;
     double safety_seconds = 60.0;
     double hold_seconds = 20.0;
@@ -351,6 +413,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--wait-seconds") == 0 && i + 1 < argc) wait_seconds = atof(argv[++i]);
         else if (strcmp(argv[i], "--max-life") == 0 && i + 1 < argc) safety_seconds = atof(argv[++i]);
         else if (strcmp(argv[i], "--loader-surface") == 0 && i + 1 < argc) surface_path = argv[++i];
+        else if (strcmp(argv[i], "--loader-notice") == 0 && i + 1 < argc) notice_path = argv[++i];
         else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
             if (freopen(argv[++i], "a", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
         }
@@ -418,6 +481,7 @@ int main(int argc, char **argv) {
         }
 
         double t = boot_seconds();
+        update_notice(t);
         progress = loginui_progress_curve(0.0, 0.45, t - start_t, 4.0);
         if (t - last_write > 0.1) {
             loginui_progress_write(LOGINUI_PROGRESS_PATH, progress);
@@ -480,6 +544,7 @@ int main(int argc, char **argv) {
     }
 
     loginui_progress_write(LOGINUI_PROGRESS_PATH, progress);
+    if (notice_path[0]) write_loader_notice(notice_path, mode.hdisplay, mode.vdisplay);
     drmDropMaster(drm_fd);
     int fd = open(MASTER_RELEASED, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd >= 0) close(fd);

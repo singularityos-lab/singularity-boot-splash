@@ -273,13 +273,19 @@ static bool write_atomic(const char *path, const uint8_t *buf, size_t n) {
     return false;
 }
 
+static int loader_surface_half(int w, int h) {
+    LoginUiBrandLayout l;
+    loginui_brand_layout(w, h, 1.0, &l);
+    double down = l.bar_y + l.bar_h - h / 2.0;
+    double up = h / 2.0 - l.logo_y;
+    return (int)(down > up ? down : up) + 2;
+}
+
 static void write_loader_surface(const char *path, struct fb *f) {
     LoginUiBrandLayout l;
     loginui_brand_layout(mode.hdisplay, mode.vdisplay, 1.0, &l);
     int w = mode.hdisplay, h = mode.vdisplay;
-    double down = l.bar_y + l.bar_h - h / 2.0;
-    double up = h / 2.0 - l.logo_y;
-    int half = (int)(down > up ? down : up) + 2;
+    int half = loader_surface_half(w, h);
     int lw = ((int)l.logo_size + 3) & ~1;
     if (lw < (int)l.bar_w + 2) lw = ((int)l.bar_w + 3) & ~1;
     int lh = 2 * half;
@@ -311,13 +317,16 @@ static void write_loader_notice(const char *path, int width, int height) {
     loginui_brand_notice_box(pcr, width, height, 1.0, text, &x, &y, &w, &h);
     cairo_destroy(pcr);
     cairo_surface_destroy(probe);
-    int nw = (int)ceil(w), nh = (int)ceil(h) + 2;
-    if (nw <= 0 || nh <= 2) return;
+    int half = loader_surface_half(width, height);
+    int top = (height - 2 * half) / 2 + 2 * half;
+    int pad = (int)y > top ? (int)y - top : 0;
+    int nw = (int)ceil(w), nh = pad + (int)ceil(h) + 2;
+    if (nw <= 0 || h <= 0) return;
     cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_RGB24, nw, nh);
     cairo_t *cr = cairo_create(s);
     cairo_set_source_rgb(cr, 0, 0, 0);
     cairo_paint(cr);
-    cairo_translate(cr, -x, -y);
+    cairo_translate(cr, -x, -(y - pad));
     loginui_render_brand_notice(cr, width, height, 1.0, text, 1.0);
     cairo_destroy(cr);
     cairo_surface_flush(s);

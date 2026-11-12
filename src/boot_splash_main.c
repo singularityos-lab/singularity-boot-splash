@@ -244,6 +244,21 @@ static void render(struct fb *f, double progress) {
     cairo_surface_flush(f->surface);
 }
 
+static void render_through(struct fb *f, cairo_surface_t *scratch, double progress) {
+    if (cairo_surface_status(scratch) != CAIRO_STATUS_SUCCESS) {
+        render(f, progress);
+        return;
+    }
+    cairo_t *cr = cairo_create(scratch);
+    draw_frame(cr, mode.hdisplay, mode.vdisplay, progress);
+    cairo_destroy(cr);
+    cairo_surface_flush(scratch);
+    const uint8_t *data = cairo_image_surface_get_data(scratch);
+    int stride = cairo_image_surface_get_stride(scratch);
+    for (uint32_t y = 0; y < mode.vdisplay; y++)
+        memcpy(f->map + (size_t)y * f->pitch, data + (size_t)y * stride, (size_t)mode.hdisplay * 4);
+}
+
 static void flush_fb(struct fb *f) {
     drmModeClip clip = { 0, 0, mode.hdisplay, mode.vdisplay };
     drmModeDirtyFB(drm_fd, f->fb_id, &clip, 1);
@@ -578,14 +593,16 @@ int main(int argc, char **argv) {
             handed_over ? "compositor taking over" : "no compositor");
 
     double h0 = boot_seconds();
+    cairo_surface_t *scratch = cairo_image_surface_create(CAIRO_FORMAT_RGB24, mode.hdisplay, mode.vdisplay);
     while (!exists(FIRST_FRAME) && boot_seconds() - h0 < hold_seconds && !want_quit) {
         double t = boot_seconds();
         progress = loginui_progress_curve(0.0, 0.45, t - start_t, 4.0);
-        render(&fbs[front], progress);
+        render_through(&fbs[front], scratch, progress);
         flush_fb(&fbs[front]);
         loginui_progress_write(LOGINUI_PROGRESS_PATH, progress);
         usleep(50000);
     }
+    cairo_surface_destroy(scratch);
 
     if (tty_fd >= 0) {
         struct vt_mode vtm = { .mode = VT_AUTO };

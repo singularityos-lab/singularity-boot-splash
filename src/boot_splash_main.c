@@ -56,6 +56,8 @@ static cairo_surface_t *logo = NULL;
 static const char *notice = NULL;
 static double notice_alpha = 0.0;
 static double notice_checked = 0.0;
+static const char *channel = NULL;
+static double channel_checked = -1.0;
 
 static int tty_fd = -1;
 static volatile sig_atomic_t vt_active = 1;
@@ -218,6 +220,10 @@ static void destroy_fb(struct fb *f) {
 }
 
 static void update_notice(double t) {
+    if (channel_checked < 0.0 || t - channel_checked >= 0.5) {
+        channel_checked = t;
+        channel = loginui_update_channel(NULL);
+    }
     if (t < NOTICE_AFTER_SECONDS || t - notice_checked < 0.5) return;
     notice_checked = t;
     notice = loginui_gpu_notice("/sys");
@@ -227,6 +233,7 @@ static void update_notice(double t) {
 
 static void draw_frame(cairo_t *cr, int width, int height, double progress) {
     loginui_render_brand_progress(cr, width, height, 1.0, logo, progress, 1.0);
+    loginui_render_brand_channel(cr, width, height, 1.0, channel, 1.0);
     loginui_render_brand_notice(cr, width, height, 1.0, notice, notice_alpha);
 }
 
@@ -307,16 +314,25 @@ static void write_loader_surface(const char *path, struct fb *f) {
 
 static void write_loader_notice(const char *path, int width, int height) {
     const char *text = loginui_gpu_notice("/sys");
-    if (!text) {
+    const char *label = loginui_update_channel(NULL);
+    if (!text && !label) {
         if (unlink(path) == 0) fprintf(stderr, "boot-splash: loader notice removed\n");
         return;
     }
     cairo_surface_t *probe = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 1, 1);
     cairo_t *pcr = cairo_create(probe);
-    double x, y, w, h;
+    double x, y, w, h, cx, cy, cw, ch;
     loginui_brand_notice_box(pcr, width, height, 1.0, text, &x, &y, &w, &h);
+    loginui_brand_channel_box(pcr, width, height, 1.0, label, &cx, &cy, &cw, &ch);
     cairo_destroy(pcr);
     cairo_surface_destroy(probe);
+    double bottom = text ? y + h : cy + ch;
+    if (!text) {
+        x = cx;
+        w = cw;
+    }
+    if (label) y = cy;
+    h = bottom - y;
     int half = loader_surface_half(width, height);
     int top = (height - 2 * half) / 2 + 2 * half;
     int pad = (int)y > top ? (int)y - top : 0;
@@ -327,6 +343,7 @@ static void write_loader_notice(const char *path, int width, int height) {
     cairo_set_source_rgb(cr, 0, 0, 0);
     cairo_paint(cr);
     cairo_translate(cr, -x, -(y - pad));
+    loginui_render_brand_channel(cr, width, height, 1.0, label, 1.0);
     loginui_render_brand_notice(cr, width, height, 1.0, text, 1.0);
     cairo_destroy(cr);
     cairo_surface_flush(s);
